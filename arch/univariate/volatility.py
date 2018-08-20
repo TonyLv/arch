@@ -16,13 +16,14 @@ from arch.univariate.distribution import Normal
 from arch.utility.array import ensure1d, DocStringInheritor
 
 try:
-    from arch.univariate.recursions import garch_recursion, harch_recursion, egarch_recursion
+    from arch.univariate.recursions import (garch_recursion, harch_recursion,
+                                            egarch_recursion, midas_recursion)
 except ImportError:  # pragma: no cover
     from arch.univariate.recursions_python import (garch_recursion, harch_recursion,
-                                                   egarch_recursion)
+                                                   egarch_recursion, midas_recursion)
 
 __all__ = ['GARCH', 'ARCH', 'HARCH', 'ConstantVariance', 'EWMAVariance', 'RiskMetrics2006',
-           'EGARCH', 'FixedVariance']
+           'EGARCH', 'FixedVariance', 'MidasHyperbolic']
 
 
 class BootstrapRng(object):
@@ -1085,7 +1086,7 @@ class HARCH(VolatilityProcess):
 
     .. math::
 
-        \sigma^{2}=\omega + \sum_{i=1}^{m}\alpha_{l_{i}}
+        \sigma_{t}^{2}=\omega + \sum_{i=1}^{m}\alpha_{l_{i}}
         \left(l_{i}^{-1}\sum_{j=1}^{l_{i}}\epsilon_{t-j}^{2}\right)
 
     In the common case where lags=[1,5,22], the model is
@@ -1198,6 +1199,230 @@ class HARCH(VolatilityProcess):
 
     def _common_forecast_components(self, parameters, resids, backcast, horizon):
         arch_params = self._harch_to_arch(parameters)
+        t = resids.shape[0]
+        m = self.lags.max()
+        resids2 = np.empty((t, m + horizon))
+        resids2[:m, :m] = backcast
+        sq_resids = resids ** 2.0
+        for i in range(m):
+            resids2[m - i - 1:, i] = sq_resids[:(t - (m - i - 1))]
+        const = arch_params[0]
+        arch = arch_params[1:]
+
+        return const, arch, resids2
+
+    def _check_forecasting_method(self, method, horizon):
+        return
+
+    def _analytic_forecast(self, parameters, resids, backcast, var_bounds, start, horizon):
+        const, arch, resids2 = self._common_forecast_components(parameters, resids, backcast,
+                                                                horizon)
+        m = self.lags.max()
+        resids2[:start] = np.nan
+        arch_rev = arch[::-1]
+        for i in range(horizon):
+            resids2[:, m + i] = const + resids2[:, i:(m + i)].dot(arch_rev)
+
+        return VarianceForecast(resids2[:, m:].copy())
+
+    def _simulation_forecast(self, parameters, resids, backcast, var_bounds, start, horizon,
+                             simulations, rng):
+        const, arch, resids2 = self._common_forecast_components(parameters, resids, backcast,
+                                                                horizon)
+        t, m = resids.shape[0], self.lags.max()
+
+        shocks = np.empty((t, simulations, horizon))
+        shocks.fill(np.nan)
+
+        paths = np.empty((t, simulations, horizon))
+        paths.fill(np.nan)
+
+        temp_resids2 = np.empty((simulations, m + horizon))
+        arch_rev = arch[::-1]
+        for i in range(start, t):
+            std_shocks = rng((simulations, horizon))
+            temp_resids2[:, :] = resids2[i:(i + 1)]
+            for j in range(horizon):
+                paths[i, :, j] = const + temp_resids2[:, j:(m + j)].dot(arch_rev)
+                shocks[i, :, j] = std_shocks[:, j] * np.sqrt(paths[i, :, j])
+                temp_resids2[:, m + j] = shocks[i, :, j] ** 2.0
+
+        return VarianceForecast(paths.mean(1), paths, shocks)
+
+
+class MidasHyperbolic(VolatilityProcess):
+    r"""
+    MIDAS Hyperbolic ARCH process
+
+    Parameters
+    ----------
+    m : int
+        Length of maximum lag to include in the model
+    asym : bool
+        Flag indicating whether to include an asymmetric term
+
+    Attributes
+    ----------
+    num_params : int
+        The number of parameters in the model
+
+    Examples
+    --------
+    >>> from arch.univariate import MidasHyperbolc
+
+    22-lag MIDAS Hyperbolic process
+
+    >>> harch = MidasHyperbolc()
+
+    Longer 66-period lag
+
+    >>> harch = MidasHyperbolc(m=66)
+
+    Asymmetric MIDAS Hyperbolic process
+
+    >>> harch = MidasHyperbolc(asym=True)
+
+    Notes
+    -----
+    In a MIDAS Hyperbolic process, the variance evolves according to
+
+    .. math::
+
+        \sigma_t^{2}=\omega + \sum_{i=1}^{m}\phi_i(\theta)
+        \left(\alpha + \gamma I\left[\epsilon_{t-i}<0\right])
+        \epsilon_{t-i}^{2}\right
+
+    where
+
+    .. math::
+
+        \phi_i(\theta) \propto \Gamma(i-1+\theta)/(\Gamma(i)\Gamma(\theta))
+
+    where :math:`Gamma` is the gamma function. :math:`\{\phi_i(\theta)\}` is
+    normalized so that :math:`\sum \phi_i(\theta)=1`
+    """
+
+    def __init__(self, m=22, asym=False):
+        super(MidasHyperbolic, self).__init__()
+        self._m = m
+        self._asym = asym
+        self.name = 'MIDAS Hyperbolic'
+
+    def __str__(self):
+        descr = self.name
+        descr += '(lags: {0}, asym: {1}'.format(self._m, self._asym)
+
+        return descr
+
+    def bounds(self, resids):
+        bounds = [(0.0, 10 * np.mean(resids ** 2.0))]  # omega
+        bounds.extend([(0.0, 1.0)])  # theta
+        bounds.extend([(0.0, 1.0)])  # alpha
+        if self._asym:
+            bounds.extend([(-2.0, 2.0)])  # gamma
+
+        return bounds
+
+    def constraints(self):
+        """
+        Constraints
+
+        Note
+        ----
+        A.dot(parameters) - b >= 0
+        omega >0, 1>theta>0,
+        alpha>0 or alpha + gamma > 0
+        alpha<1 or alpha+0.5*gamma<1
+        -2 < gamma < 2
+        """
+        symm = not self._asym
+        k = 3 + self._asym
+        a = zeros((5 + 2 * self._asym, k))
+        b = zeros(5 + 2 * self._asym)
+        # omega
+        a[0, 0] = 1.0
+        # theta
+        a[1, 1] = 1.0
+        a[2, 1] = -1.0
+        b[2] = -1.0
+        # alpha >0 or alpha+gamma>0
+        # alpha<1 or alpha+0.5*gamma<1
+        if symm:
+            a[3, 2] = 1.0
+            a[4, 2] = -1.0
+        else:
+            a[3, 2:4] = 1.0
+            a[4, 2:4] = [-1, -0.5]
+        b[4] = -1.0
+        if not symm:
+            a[5, 3] = 1.0
+            a[6, 3] = -1.0
+            b[5] = 2.0
+            b[6] = -2.0
+
+        return a, b
+
+    def compute_variance(self, parameters, resids,
+                         sigma2, backcast, var_bounds):
+        lags = self.lags
+        nobs = resids.shape[0]
+        trans_parameters = self._to_arch(parameters)
+        midas_recursion(trans_parameters, resids, sigma2, nobs, backcast, var_bounds)
+
+        return sigma2
+
+    def simulate(self, parameters, nobs, rng, burn=500, initial_value=None):
+        lags = self.lags
+        errors = rng(nobs + burn)
+
+        if initial_value is None:
+            if (1.0 - np.sum(parameters[1:])) > 0:
+                initial_value = parameters[0] / (1.0 - np.sum(parameters[1:]))
+            else:
+                from warnings import warn
+
+                warn('Parameters are not consistent with a stationary model. Using the intercept '
+                     'to initialize the model.')
+                initial_value = parameters[0]
+
+        sigma2 = empty(nobs + burn)
+        data = empty(nobs + burn)
+        max_lag = np.max(lags)
+        sigma2[:max_lag] = initial_value
+        data[:max_lag] = sqrt(initial_value)
+        for t in range(max_lag, nobs + burn):
+            sigma2[t] = parameters[0]
+            for i in range(lags.shape[0]):
+                param = parameters[1 + i] / lags[i]
+                for j in range(lags[i]):
+                    sigma2[t] += param * data[t - 1 - j] ** 2.0
+            data[t] = errors[t] * sqrt(sigma2[t])
+
+        return data[burn:], sigma2[burn:]
+
+    def starting_values(self, resids):
+        k_arch = self._num_lags
+
+        alpha = 0.9
+        sv = (1.0 - alpha) * resids.var() * ones((k_arch + 1))
+        sv[1:] = alpha / k_arch
+
+        return sv
+
+    def parameter_names(self):
+        names = ['omega', 'theta', 'alpha']
+        if self._asym:
+            names += ['gamma']
+
+        return names
+
+    def _to_arch(self, params):
+        raise NotImplementedError
+
+        return arch_params
+
+    def _common_forecast_components(self, parameters, resids, backcast, horizon):
+        arch_params = self._to_arch(parameters)
         t = resids.shape[0]
         m = self.lags.max()
         resids2 = np.empty((t, m + horizon))
@@ -1655,7 +1880,7 @@ class RiskMetrics2006(VolatilityProcess):
                 for k in range(kmax):
                     mu = mus[k]
                     temp_paths[k, :, j] = mu * temp_paths[k, :, j - 1] + \
-                        (1 - mu) * shocks[i, :, j - 1] ** 2.0
+                                          (1 - mu) * shocks[i, :, j - 1] ** 2.0
                 paths[i, :, j] = w.dot(temp_paths[:, :, j])
                 shocks[i, :, j] = std_shocks[:, j] * np.sqrt(paths[i, :, j])
 

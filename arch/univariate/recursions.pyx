@@ -278,3 +278,53 @@ def egarch_recursion(double[:] parameters,
         abs_std_resids[t] = fabs(std_resids[t])
 
     return sigma2
+
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+def midas_recursion(double[:] parameters,
+                    double[:] resids,
+                    double[:] sigma2,
+                    int nobs,
+                    double backcast,
+                    double[:, :] var_bounds):
+    """
+    Parameters
+    ----------
+    parameters : 1-d array, float64
+        Model parameters
+    resids : 1-d array, float64
+        Residuals to use in the recursion
+    sigma2 : 1-d array, float64
+        Conditional variances with same shape as resids
+    nobs : int
+        Length of resids
+    backcast : float64
+        Value to use when initializing the recursion
+    var_bounds : 2-d array
+        nobs by 2-element array of upper and lower bounds for conditional
+        variances for each time period
+    """
+    cdef Py_ssize_t m, t, i, num_lags
+    cdef int j
+    cdef double param
+
+    m = parameters.shape[0]
+    for t in range(nobs):
+        sigma2[t] = parameters[0]
+        for i in range(m):
+            if (t - i - 1) >= 0:
+                sigma2[t] += parameters[i + 1] * resids[t - i - 1] * resids[t - i - 1]
+            else:
+                sigma2[t] += parameters[i + 1] * backcast
+        if sigma2[t] < var_bounds[t, 0]:
+            sigma2[t] = var_bounds[t, 0]
+        elif sigma2[t] > var_bounds[t, 1]:
+            if not np.isinf(sigma2[t]):
+                sigma2[t] = var_bounds[t, 1] + np.log(sigma2[t] / var_bounds[t, 1])
+            else:
+                sigma2[t] = var_bounds[t, 1] + 1000
+
+    return sigma2

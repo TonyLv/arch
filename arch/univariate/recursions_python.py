@@ -241,3 +241,42 @@ def egarch_recursion_python(parameters, resids, sigma2, p, o, q, nobs,
 
 
 egarch_recursion = jit(egarch_recursion_python)
+
+
+def midas_recursion_python(parameters, resids, sigma2, nobs, backcast, var_bounds):
+    """
+    Parameters
+    ----------
+    parameters : array
+        Model parameters
+    resids : array
+        Residuals to use in the recursion
+    sigma2 : array
+        Conditional variances with same shape as resids
+    nobs : int
+        Length of resids
+    backcast : float
+        Value to use when initializing the recursion
+    var_bounds : array
+        nobs by 2-element array of upper and lower bounds for conditional
+        variances for each time period
+    """
+    m = parameters.shape[0]
+    for t in range(nobs):
+        sigma2[t] = parameters[0]
+        for i in range(m):
+            if (t - i - 1) >= 0:
+                sigma2[t] += parameters[i + 1] * resids[t - i - 1] * resids[t - i - 1]
+            else:
+                sigma2[t] += parameters[i + 1] * backcast
+        if sigma2[t] < var_bounds[t, 0]:
+            sigma2[t] = var_bounds[t, 0]
+        elif sigma2[t] > var_bounds[t, 1]:
+            if not np.isinf(sigma2[t]):
+                sigma2[t] = var_bounds[t, 1] + np.log(sigma2[t] / var_bounds[t, 1])
+            else:
+                sigma2[t] = var_bounds[t, 1] + 1000
+
+    return sigma2
+
+midas_recursion = jit(midas_recursion_python)
